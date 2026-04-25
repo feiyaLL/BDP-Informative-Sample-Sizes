@@ -1,6 +1,6 @@
 # A Nonparametric Bayesian Shrinkage Estimator for Binomial Data under Informative Sample Sizes
 
-R code for the manuscript by Lufeiya Liu (lul115@pitt.edu), Spring 2026.
+R code for the report by Lufeiya Liu (lul115@pitt.edu), Spring 2026.
 
 This project extends Zhang & Liu (2012, *Canadian Journal of Statistics*)
 "Nonparametric hierarchical Bayes analysis of binomial data via Bernstein
@@ -26,7 +26,7 @@ When `beta = 0`, the model reduces exactly to Zhang and Liu's standard BDP.
 ## Files
 
 - `BDP_Informative_N_Final.Rmd` — main R Markdown file containing all code
-- `figs/` — output directory for manuscript figures (created at runtime)
+- `figs/` — output directory for report figures (created at runtime)
 - `results/` — output directory for saved RData files (created at runtime)
 - `data/` — directory for input data (Brown's MLB data, Stack Overflow query results)
 
