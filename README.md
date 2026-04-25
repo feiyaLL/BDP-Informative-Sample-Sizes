@@ -53,7 +53,7 @@ If you only want to verify the headline baseball result:
 1. Place `monthly_data_2005_commas.TXT` in `data/`
 2. Run sections 1, 2, and 3 of the Rmd
 
-### Full reproduction (~10 hours)
+### Full reproduction (~15 hours)
 
 1. Place data files in `data/`
 2. Run all sections, including the K_max sensitivity sweep (Section 3.5)
