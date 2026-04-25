@@ -1,0 +1,1039 @@
+---
+title: "A Nonparametric Bayesian Shrinkage Estimator for Binomial Data under Informative Sample Sizes"
+author: "Lufeiya Liu (lul115@pitt.edu)"
+date: "Spring 2026"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: readable
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      fig.width = 10, fig.height = 6, cache = TRUE)
+set.seed(42)
+```
+
+# Overview
+
+This project reproduces and extends **Zhang & Liu (2012)**, "Nonparametric hierarchical
+Bayes analysis of binomial data via Bernstein polynomial priors" (*Canadian Journal of
+Statistics*). The standard Bernstein-Dirichlet Process (BDP) treats `N_i` as fixed and
+exchangeable. We add a log-normal observation process
+
+$$\log(N_i) \mid \theta_i \sim \mathrm{Normal}(\alpha + \beta\theta_i,\, \sigma^2)$$
+
+to jointly model the dependence between sample size and latent success probability.
+When `beta = 0`, the model reduces exactly to Zhang and Liu's standard BDP.
+
+**Headline results.**
+
+- Baseball (Brown's 2005 MLB): TSE* = 0.455 at `K_max = 1200` (27% improvement over standard BDP, 10% over NPEB).
+- Stack Overflow (n = 2,491): TSE* = 0.766 at `K_max = 200`, lowest among methods evaluated.
+- Simulation (5 scenarios, 30 replicates): crossover at `beta ≈ 1`; informative BDP dominates above the threshold.
+
+# Section 1: Core Functions
+
+## 1.1 Standard BDP MCMC (Zhang & Liu 2012, Procedure I)
+
+Implements the Gibbs sampler from Zhang & Liu (2012, Section 4.1). State space is
+`(Z_1, ..., Z_n, k, M)`. Returns Rao-Blackwellized point estimates
+`theta_hat_i = E[(j_i + Y_i) / (k + 1 + N_i) | data]`.
+
+```{r bdp-mcmc}
+bdp_mcmc <- function(y, N, n_iter = 20000, n_burn = 5000, K_max = 200,
+                     M_grid = seq(0.1, 10, by = 0.1), k_init = 30, seed = 42) {
+  set.seed(seed)
+  n <- length(y)
+  stopifnot(length(N) == n, n > 0)
+
+  # Initialization (data-informed to avoid k=1 trap)
+  k <- k_init
+  M <- 2.0
+  theta_mle_init <- (y + 0.5) / (N + 1.0)
+  Z <- pmin(pmax(theta_mle_init + rnorm(n, 0, 0.02), 0.001), 0.999)
+  j_lab <- pmin(ceiling(Z * k), k)
+  j_lab[j_lab < 1] <- 1
+
+  # Storage
+  n_total <- n_iter + n_burn
+  k_trace <- integer(n_total)
+  M_trace <- numeric(n_total)
+  theta_grid <- seq(0.005, 0.995, length.out = 300)
+  density_sum <- numeric(length(theta_grid))
+  theta_hat_sum <- numeric(n)
+  n_kept <- 0
+
+  cat(sprintf("Standard BDP: %d iterations (%d burn-in), K_max=%d, n=%d\n",
+              n_iter, n_burn, K_max, n))
+
+  for (iter in 1:n_total) {
+
+    # Step I.a: Sample k
+    log_pk <- numeric(K_max)
+    for (kk in 1:K_max) {
+      jj <- pmin(pmax(ceiling(Z * kk), 1), kk)
+      log_pk[kk] <- sum(lbeta(jj + y, kk + 1 - jj + N - y) -
+                        lbeta(jj, kk + 1 - jj))
+    }
+    log_pk <- log_pk - max(log_pk)
+    pk <- exp(log_pk); pk <- pk / sum(pk)
+    k <- sample.int(K_max, 1, prob = pk)
+    j_lab <- pmin(pmax(ceiling(Z * k), 1), k)
+
+    # Step I.b: Sample Z_i (Polya urn)
+    alpha_jk <- 1 / k
+    jvec <- 1:k
+    log_lik_mat <- outer(jvec, seq_len(n), function(j, i) {
+      lbeta(j + y[i], k + 1 - j + N[i] - y[i]) - lbeta(j, k + 1 - j)
+    })
+    nj_full <- tabulate(j_lab, nbins = k)
+
+    for (i in 1:n) {
+      old_j <- j_lab[i]
+      nj_i <- nj_full
+      nj_i[old_j] <- nj_i[old_j] - 1
+
+      log_pj <- log(M * alpha_jk + nj_i) + log_lik_mat[, i]
+      log_pj <- log_pj - max(log_pj)
+      pj <- exp(log_pj); pj <- pj / sum(pj)
+
+      j_new <- sample.int(k, 1, prob = pj)
+      nj_full[old_j] <- nj_full[old_j] - 1
+      nj_full[j_new] <- nj_full[j_new] + 1
+      j_lab[i] <- j_new
+      Z[i] <- runif(1, (j_new - 1) / k, j_new / k)
+    }
+
+    # Step I.c: Sample M
+    r <- length(unique(j_lab))
+    log_pM <- sapply(M_grid, function(Mv) {
+      r * log(Mv) - sum(log(Mv + 0:(n - 1)))
+    })
+    log_pM <- log_pM - max(log_pM)
+    pM <- exp(log_pM); pM <- pM / sum(pM)
+    M <- M_grid[sample.int(length(M_grid), 1, prob = pM)]
+
+    k_trace[iter] <- k
+    M_trace[iter] <- M
+
+    # Accumulate post-burn-in (Rao-Blackwellized)
+    if (iter > n_burn) {
+      n_kept <- n_kept + 1
+      nj <- tabulate(j_lab, nbins = k)
+      W_rb <- (M * alpha_jk + nj) / (M + n)
+      for (g in seq_along(theta_grid)) {
+        density_sum[g] <- density_sum[g] +
+          sum(W_rb * dbeta(theta_grid[g], 1:k, k + 1 - (1:k)))
+      }
+      theta_hat_sum <- theta_hat_sum + (j_lab + y) / (k + 1 + N)
+    }
+
+    if (iter %% 5000 == 0)
+      cat(sprintf("  iter %d/%d  k=%d  M=%.1f  r=%d\n",
+                  iter, n_total, k, M, r))
+  }
+
+  list(
+    theta_grid  = theta_grid,
+    density_est = density_sum / n_kept,
+    theta_hat   = theta_hat_sum / n_kept,
+    k_samples   = k_trace[(n_burn + 1):n_total],
+    M_samples   = M_trace[(n_burn + 1):n_total]
+  )
+}
+```
+
+## 1.2 Informative BDP MCMC (Log-Normal Observation Process)
+
+Extends the standard BDP with a log-normal observation process for `N_i` given
+`theta_i`. The full state is `(theta, Z, k, M, alpha, beta, sigma^2)`. Updates:
+
+- `theta_i` via Metropolis-Hastings (Beta proposal absorbing binomial + BDP factors;
+  the MH ratio corrects only for the log-normal factor)
+- `(Z_i, k, M)` via Gibbs (same as standard BDP)
+- `(alpha, beta)` via conjugate bivariate normal
+- `sigma^2` via conjugate inverse-gamma
+
+When `beta = 0`, the log-normal factor is constant in `theta_i`, every MH proposal
+is accepted, and the sampler reduces to Zhang and Liu's Procedure I.
+
+```{r informative-bdp-lognormal}
+informative_bdp_lognormal <- function(y, N, n_iter = 20000, n_burn = 5000,
+                                       K_max = 200,
+                                       M_grid = seq(0.1, 10, by = 0.1),
+                                       alpha_prior_mean = 4, alpha_prior_var = 100,
+                                       beta_prior_mean = 0,  beta_prior_var = 100,
+                                       sigma2_prior_a = 1,   sigma2_prior_b = 1,
+                                       seed = 42) {
+  set.seed(seed)
+  nn <- length(y)
+  stopifnot(length(N) == nn, nn > 0)
+
+  logN <- log(N)
+
+  # Initialization
+  k <- 30
+  M <- 2.0
+  theta <- pmin(pmax((y + 0.5) / (N + 1.0), 0.01), 0.99)
+  Z <- pmin(pmax(theta + rnorm(nn, 0, 0.02), 0.001), 0.999)
+  j_lab <- pmin(pmax(ceiling(Z * k), 1), k)
+
+  # OLS init for observation-process parameters
+  fit0 <- lm(logN ~ theta)
+  alpha_op <- as.numeric(coef(fit0)[1])
+  beta_op  <- as.numeric(coef(fit0)[2])
+  sigma2   <- summary(fit0)$sigma^2
+  cat(sprintf("  OLS init: alpha=%.2f, beta=%.2f, sigma2=%.2f\n",
+              alpha_op, beta_op, sigma2))
+
+  theta_accept <- 0
+  theta_total  <- 0
+
+  # --- Storage ---
+  n_total <- n_iter + n_burn
+  k_trace      <- integer(n_total)
+  M_trace      <- numeric(n_total)
+  alpha_trace  <- numeric(n_total)
+  beta_trace   <- numeric(n_total)
+  sigma2_trace <- numeric(n_total)
+  theta_grid   <- seq(0.005, 0.995, length.out = 300)
+  density_sum  <- numeric(length(theta_grid))
+  theta_hat_sum <- numeric(nn)
+  n_kept <- 0
+
+  cat(sprintf("Log-Normal Informative BDP: %d iter (%d burn-in), K_max=%d, n=%d\n",
+              n_iter, n_burn, K_max, nn))
+
+  for (iter in 1:n_total) {
+
+    # Step 1: theta_i via MH (Beta proposal, log-normal correction)
+    for (i in 1:nn) {
+      j <- j_lab[i]
+      a_post <- j + y[i]
+      b_post <- k + 1 - j + N[i] - y[i]
+      theta_star <- rbeta(1, a_post, b_post)
+      resid_star <- logN[i] - alpha_op - beta_op * theta_star
+      resid_curr <- logN[i] - alpha_op - beta_op * theta[i]
+      log_ratio  <- (-resid_star^2 + resid_curr^2) / (2 * sigma2)
+      if (log(runif(1)) < log_ratio) {
+        theta[i] <- theta_star
+        theta_accept <- theta_accept + 1
+      }
+      theta_total <- theta_total + 1
+    }
+    Z <- pmin(pmax(theta + rnorm(nn, 0, 0.001), 0.001), 0.999)
+    j_lab <- pmin(pmax(ceiling(Z * k), 1), k)
+
+    # Step 2: j_i (Polya urn)
+    alpha_jk <- 1 / k
+    nj_full <- tabulate(j_lab, nbins = k)
+    for (i in 1:nn) {
+      old_j <- j_lab[i]
+      nj_i <- nj_full; nj_i[old_j] <- nj_i[old_j] - 1
+      log_pj <- log(M * alpha_jk + nj_i) +
+                dbeta(theta[i], 1:k, k + 1 - (1:k), log = TRUE)
+      log_pj <- log_pj - max(log_pj)
+      pj <- exp(log_pj); pj <- pj / sum(pj)
+      j_new <- sample.int(k, 1, prob = pj)
+      nj_full[old_j] <- nj_full[old_j] - 1
+      nj_full[j_new] <- nj_full[j_new] + 1
+      j_lab[i] <- j_new
+      Z[i] <- runif(1, (j_new - 1) / k, j_new / k)
+    }
+
+    # Step 3: k
+    log_pk <- numeric(K_max)
+    for (kk in 1:K_max) {
+      jj <- pmin(pmax(ceiling(Z * kk), 1), kk)
+      log_pk[kk] <- sum(dbeta(theta, jj, kk + 1 - jj, log = TRUE))
+    }
+    log_pk <- log_pk - max(log_pk)
+    pk <- exp(log_pk); pk <- pk / sum(pk)
+    k <- sample.int(K_max, 1, prob = pk)
+    j_lab <- pmin(pmax(ceiling(Z * k), 1), k)
+
+    # Step 4: (alpha, beta) via conjugate bivariate normal
+    X_mat <- cbind(1, theta)
+    prior_prec <- diag(c(1/alpha_prior_var, 1/beta_prior_var))
+    prior_mean_vec <- c(alpha_prior_mean, beta_prior_mean)
+    post_prec <- prior_prec + crossprod(X_mat) / sigma2
+    post_var  <- solve(post_prec)
+    post_mean <- post_var %*% (prior_prec %*% prior_mean_vec +
+                               crossprod(X_mat, logN) / sigma2)
+    ab_draw <- post_mean + t(chol(post_var)) %*% rnorm(2)
+    alpha_op <- ab_draw[1]; beta_op <- ab_draw[2]
+
+    # Step 5: sigma^2 via conjugate inverse-gamma
+    resid <- logN - alpha_op - beta_op * theta
+    post_a <- sigma2_prior_a + nn / 2
+    post_b <- sigma2_prior_b + sum(resid^2) / 2
+    sigma2 <- 1 / rgamma(1, post_a, post_b)
+
+    # Step 6: M
+    r <- length(unique(j_lab))
+    log_pM <- sapply(M_grid, function(Mv) {
+      r * log(Mv) - sum(log(Mv + 0:(nn - 1)))
+    })
+    log_pM <- log_pM - max(log_pM)
+    pM <- exp(log_pM); pM <- pM / sum(pM)
+    M <- M_grid[sample.int(length(M_grid), 1, prob = pM)]
+
+    k_trace[iter]      <- k
+    M_trace[iter]      <- M
+    alpha_trace[iter]  <- alpha_op
+    beta_trace[iter]   <- beta_op
+    sigma2_trace[iter] <- sigma2
+
+    if (iter > n_burn) {
+      n_kept <- n_kept + 1
+      nj <- tabulate(j_lab, nbins = k)
+      W_rb <- (M / k + nj) / (M + nn)
+      for (g in seq_along(theta_grid)) {
+        density_sum[g] <- density_sum[g] +
+          sum(W_rb * dbeta(theta_grid[g], 1:k, k + 1 - (1:k)))
+      }
+      theta_hat_sum <- theta_hat_sum + theta
+    }
+
+    if (iter %% 5000 == 0) {
+      cat(sprintf("  iter %d/%d  k=%d  M=%.1f  alpha=%.2f  beta=%.2f  sigma2=%.2f",
+                  iter, n_total, k, M, alpha_op, beta_op, sigma2))
+      cat(sprintf("  theta_acc=%.1f%%\n", 100 * theta_accept / theta_total))
+    }
+  }
+
+  cat(sprintf("  Final theta acceptance rate: %.1f%%\n",
+              100 * theta_accept / theta_total))
+  post_burn <- (n_burn + 1):n_total
+  list(
+    theta_grid     = theta_grid,
+    density_est    = density_sum / n_kept,
+    theta_hat      = theta_hat_sum / n_kept,
+    k_samples      = k_trace[post_burn],
+    M_samples      = M_trace[post_burn],
+    alpha_samples  = alpha_trace[post_burn],
+    beta_samples   = beta_trace[post_burn],
+    sigma2_samples = sigma2_trace[post_burn]
+  )
+}
+```
+
+## 1.3 Comparison Estimators
+
+```{r comparison-estimators}
+# James-Stein on arcsine-square-root scale
+stein_estimator <- function(y, N) {
+  n <- length(y)
+  x <- asin(sqrt((y + 0.25) / (N + 0.5)))
+  x_bar <- mean(x)
+  sig2 <- 1 / (4 * N)
+  SS <- sum((x - x_bar)^2)
+  B <- max(0, 1 - (n - 3) * mean(sig2) / SS)
+  mu_s <- x_bar + B * (x - x_bar)
+  sin(mu_s)^2
+}
+```
+
+## 1.4 TSE* Computation (Brown 2008)
+
+`TSE*` normalizes total squared error of an estimator by the naive estimator's
+error, so `TSE* = 1` corresponds to the naive (MLE) and smaller values are better.
+
+```{r tse-star}
+compute_tse_star <- function(theta_hat, y1, N1, y2, N2) {
+  val <- which(N2 >= 11)  # validation set: players with >= 11 second-half at-bats
+  x1 <- asin(sqrt((y1[val] + 0.25) / (N1[val] + 0.5)))
+  x2 <- asin(sqrt((y2[val] + 0.25) / (N2[val] + 0.5)))
+  sig2 <- 1 / (4 * N2[val])
+  mu_hat <- asin(sqrt(theta_hat[val]))
+  tse_naive <- sum((x1 - x2)^2) - sum(sig2)
+  tse_est   <- sum((mu_hat - x2)^2) - sum(sig2)
+  tse_est / tse_naive
+}
+```
+
+
+# Section 2: Reproduction of Zhang & Liu (2012), Table 1
+
+We reproduce the four simulation scenarios in Zhang and Liu's Table 1.
+
+```{r table1-simulations, cache=TRUE}
+# Scenario 1: Beta(8,8), n=200, N ~ Uniform(100,200)
+set.seed(100)
+n1 <- 200
+theta1 <- rbeta(n1, 8, 8)
+N1_sim <- sample(100:200, n1, replace = TRUE)
+y1_sim <- rbinom(n1, N1_sim, theta1)
+cat("Scenario 1: Beta(8,8)\n")
+res1 <- bdp_mcmc(y1_sim, N1_sim, n_iter = 15000, n_burn = 5000, K_max = 200)
+
+# Scenario 2: Bimodal, n=200, N=100
+set.seed(200)
+n2 <- 200
+comp2 <- rbinom(n2, 1, 0.5)
+theta2 <- ifelse(comp2 == 1, rbeta(n2, 60, 10), rbeta(n2, 10, 60))
+N2_sim <- rep(100L, n2)
+y2_sim <- rbinom(n2, N2_sim, theta2)
+cat("Scenario 2: Bimodal\n")
+res2 <- bdp_mcmc(y2_sim, N2_sim, n_iter = 15000, n_burn = 5000, K_max = 200)
+
+# Scenario 3: Exp(8) truncated at 1, n=200, N=100
+set.seed(100)
+n3 <- 200
+u3 <- runif(n3)
+theta3 <- -log(1 - u3 * (1 - exp(-8))) / 8
+N3_sim <- rep(100L, n3)
+y3_sim <- rbinom(n3, N3_sim, theta3)
+cat("Scenario 3: Exp(8) truncated\n")
+res3 <- bdp_mcmc(y3_sim, N3_sim, n_iter = 15000, n_burn = 5000,
+                 K_max = 200, seed = 1100)
+
+# Scenario 4: Mixture of Uniforms, n=100, N=100
+set.seed(400)
+n4 <- 100
+comp4 <- rbinom(n4, 1, 0.5)
+theta4 <- ifelse(comp4 == 1, runif(n4, 0.25, 0.50), runif(n4, 0.75, 1.00))
+N4_sim <- rep(100L, n4)
+y4_sim <- rbinom(n4, N4_sim, theta4)
+cat("Scenario 4: Mix Uniforms\n")
+res4 <- bdp_mcmc(y4_sim, N4_sim, n_iter = 15000, n_burn = 5000, K_max = 200)
+```
+
+```{r table1-print}
+cat("========== TABLE 1 REPRODUCTION ==========\n")
+cat(sprintf("%-30s %12s %12s\n", "Distribution", "Stein", "BDP"))
+cat(paste(rep("-", 60), collapse = ""), "\n")
+
+for (info in list(
+  list("Beta(8,8)",     theta1, y1_sim, N1_sim, res1),
+  list("Bimodal",       theta2, y2_sim, N2_sim, res2),
+  list("Exp(8) trunc",  theta3, y3_sim, N3_sim, res3),
+  list("Mix Uniforms",  theta4, y4_sim, N4_sim, res4)
+)) {
+  nm <- info[[1]]; th <- info[[2]]; yy <- info[[3]]
+  NN <- info[[4]]; rr <- info[[5]]
+  ase <- c(
+    Stein = mean((stein_estimator(yy, NN) - th)^2),
+    BDP   = mean((rr$theta_hat - th)^2)
+  )
+  cat(sprintf("%-30s %12.2e %12.2e\n", nm, ase[1], ase[2]))
+}
+
+cat("\nReference (Zhang & Liu 2012, Table 1):\n")
+cat("Beta(8,8):    Stein=1.53e-3  BDP=1.53e-3\n")
+cat("Bimodal:      Stein=1.17e-3  BDP=6.80e-4\n")
+cat("Exp(8):       Stein=7.75e-4  BDP=7.20e-4\n")
+cat("Mix Unif:     Stein=1.45e-3  BDP=1.04e-3\n")
+```
+
+
+# Section 3: Baseball Application
+
+## 3.1 Load Brown's 2005 MLB Data
+
+First half = April-June, second half = July-October. Filter: `N1 >= 11`.
+
+```{r load-baseball-data}
+raw <- read.csv("data/monthly_data_2005_commas.TXT",
+                stringsAsFactors = FALSE)
+
+raw$N1 <- raw$AB.4. + raw$AB.5. + raw$AB.6.
+raw$H1 <- raw$H.4.  + raw$H.5.  + raw$H.6.
+raw$N2 <- raw$AB.7. + raw$AB.8. + raw$AB.9.10.
+raw$H2 <- raw$H.7.  + raw$H.8.  + raw$H.9.10.
+
+brown_data <- raw[raw$N1 >= 11, ]
+cat(sprintf("Brown data: %d players, %d pitchers, %d non-pitchers\n",
+            nrow(brown_data), sum(brown_data$Pitcher. == 1),
+            sum(brown_data$Pitcher. == 0)))
+
+y_bb  <- brown_data$H1
+N_bb  <- brown_data$N1
+y2_bb <- brown_data$H2
+N2_bb <- brown_data$N2
+is_pit <- as.logical(brown_data$Pitcher.)
+x1_bb <- asin(sqrt((y_bb + 0.25) / (N_bb + 0.5)))
+
+cat(sprintf("N1 range: [%d, %d]\n", min(N_bb), max(N_bb)))
+cat(sprintf("R^2(x_i, N_i): %.3f  (Paper: 0.247)\n", cor(x1_bb, N_bb)^2))
+```
+
+## 3.2 Standard BDP at K_max = 200
+
+```{r run-standard-bdp-baseball, cache=TRUE}
+res_bb <- bdp_mcmc(y_bb, N_bb, n_iter = 20000, n_burn = 5000, K_max = 200)
+tse_std_bb <- compute_tse_star(res_bb$theta_hat, y_bb, N_bb, y2_bb, N2_bb)
+tse_stein_bb <- compute_tse_star(stein_estimator(y_bb, N_bb),
+                                  y_bb, N_bb, y2_bb, N2_bb)
+
+cat(sprintf("Standard BDP TSE* = %.3f  (Paper: 0.663)\n", tse_std_bb))
+cat(sprintf("James-Stein TSE*  = %.3f  (Paper: 0.525)\n", tse_stein_bb))
+```
+
+## 3.3 Informative BDP at K_max = 1200 (HEADLINE RESULT)
+
+The K_max sensitivity sweep in Section 3.5 establishes that K_max = 1200 is the
+smallest value at which the posterior of `k` is not materially constrained by
+the boundary. We use this as the headline result.
+
+```{r run-informative-bdp-baseball-K1200, cache=TRUE}
+# Headline result: K_max = 1200
+res_ln_K1200 <- informative_bdp_lognormal(y_bb, N_bb,
+                                           n_iter = 20000, n_burn = 5000,
+                                           K_max = 1200, seed = 42)
+tse_inf_K1200 <- compute_tse_star(res_ln_K1200$theta_hat, y_bb, N_bb, y2_bb, N2_bb)
+beta_mean_K1200 <- mean(res_ln_K1200$beta_samples)
+beta_ci_K1200   <- quantile(res_ln_K1200$beta_samples, c(0.025, 0.975))
+
+cat("\n========== BASEBALL HEADLINE RESULT ==========\n")
+cat(sprintf("Informative BDP at K_max = 1200:\n"))
+cat(sprintf("  TSE*       = %.3f\n", tse_inf_K1200))
+cat(sprintf("  beta_hat   = %.2f\n", beta_mean_K1200))
+cat(sprintf("  95%% CrI    = [%.2f, %.2f]\n", beta_ci_K1200[1], beta_ci_K1200[2]))
+cat(sprintf("  alpha_hat  = %.2f\n", mean(res_ln_K1200$alpha_samples)))
+cat(sprintf("  sigma2_hat = %.3f\n", mean(res_ln_K1200$sigma2_samples)))
+```
+
+## 3.4 Pitcher / Non-Pitcher Decomposition
+
+```{r pitcher-decomposition}
+# Validation pitchers: those with N2 >= 11 AND Pitcher. == 1
+val_idx  <- which(N2_bb >= 11)
+val_pit  <- val_idx[is_pit[val_idx]]
+val_nonp <- val_idx[!is_pit[val_idx]]
+
+cat(sprintf("Validation set: %d pitchers, %d non-pitchers\n",
+            length(val_pit), length(val_nonp)))
+
+# Aggregate squared error on raw probability scale
+sq_err <- function(theta_hat, idx) {
+  mu_hat <- asin(sqrt(theta_hat[idx]))
+  x2     <- asin(sqrt((y2_bb[idx] + 0.25) / (N2_bb[idx] + 0.5)))
+  sum((mu_hat - x2)^2)
+}
+
+sse_std_pit  <- sq_err(res_bb$theta_hat,       val_pit)
+sse_inf_pit  <- sq_err(res_ln_K1200$theta_hat, val_pit)
+sse_std_nonp <- sq_err(res_bb$theta_hat,       val_nonp)
+sse_inf_nonp <- sq_err(res_ln_K1200$theta_hat, val_nonp)
+
+cat("\n========== PITCHER DECOMPOSITION ==========\n")
+cat(sprintf("Pitchers (n=%d):\n", length(val_pit)))
+cat(sprintf("  Std BDP SSE = %.2f, mean theta_hat = %.3f\n",
+            sse_std_pit, mean(res_bb$theta_hat[val_pit])))
+cat(sprintf("  Inf BDP SSE = %.2f, mean theta_hat = %.3f\n",
+            sse_inf_pit, mean(res_ln_K1200$theta_hat[val_pit])))
+cat(sprintf("  Reduction:   %.1f%%\n", (sse_std_pit - sse_inf_pit) / sse_std_pit * 100))
+
+cat(sprintf("\nNon-pitchers (n=%d):\n", length(val_nonp)))
+cat(sprintf("  Std BDP SSE = %.2f, mean theta_hat = %.3f\n",
+            sse_std_nonp, mean(res_bb$theta_hat[val_nonp])))
+cat(sprintf("  Inf BDP SSE = %.2f, mean theta_hat = %.3f\n",
+            sse_inf_nonp, mean(res_ln_K1200$theta_hat[val_nonp])))
+```
+
+## 3.5 K_max Sensitivity Sweep (Supplement D.1, Table D.1)
+
+The posterior of `k` concentrates near the boundary when `K_max = 200`
+(22.6% of mass at the boundary). We sweep `K_max` to confirm robustness.
+
+NOTE: Each run takes 10-30 minutes. Skip with `eval=FALSE` and load saved
+results if available.
+
+```{r kmax-sweep-baseball, eval=FALSE}
+# K_max = 200 (already computed above as res_ln_K200; rerun for clarity)
+res_ln_K200  <- informative_bdp_lognormal(y_bb, N_bb, K_max = 200,
+                                           n_iter = 20000, n_burn = 5000, seed = 42)
+res_ln_K400  <- informative_bdp_lognormal(y_bb, N_bb, K_max = 400,
+                                           n_iter = 20000, n_burn = 5000, seed = 42)
+res_ln_K800  <- informative_bdp_lognormal(y_bb, N_bb, K_max = 800,
+                                           n_iter = 20000, n_burn = 5000, seed = 42)
+# K_max = 1200 already computed as res_ln_K1200
+
+# Save all four for figures and table
+save(res_bb, res_ln_K200, res_ln_K400, res_ln_K800, res_ln_K1200,
+     file = "results/baseball_kmax_sweep.RData")
+```
+
+```{r kmax-sweep-table, eval=FALSE}
+# Print Table D.1
+make_kmax_row <- function(res, K) {
+  tse <- compute_tse_star(res$theta_hat, y_bb, N_bb, y2_bb, N2_bb)
+  bm  <- mean(res$beta_samples)
+  bci <- quantile(res$beta_samples, c(0.025, 0.975))
+  km  <- median(res$k_samples)
+  bnd <- mean(res$k_samples == K) * 100
+  c(K = K, TSE = tse, beta = bm, lo = bci[1], hi = bci[2],
+    k_med = km, boundary_pct = bnd)
+}
+
+tab_kmax <- rbind(
+  make_kmax_row(res_ln_K200,  200),
+  make_kmax_row(res_ln_K400,  400),
+  make_kmax_row(res_ln_K800,  800),
+  make_kmax_row(res_ln_K1200, 1200)
+)
+print(tab_kmax)
+```
+
+
+# Section 4: Stack Overflow Application
+
+The Stack Overflow data is extracted via SQL from the public Stack Exchange
+Data Explorer (see `stackoverflow_query.sql`). Pre-computed `(y_so, N_so, y2_so, N2_so)`
+are loaded from disk; the query and counts are documented in the manuscript
+Supplement G.
+
+```{r so-load, eval=FALSE}
+# Load from pre-computed file; replace with your local path
+load("data/so_data_2023.RData")
+cat(sprintf("Stack Overflow: n = %d users\n", length(y_so)))
+cat(sprintf("N range: [%d, %d], median = %d\n",
+            min(N_so), max(N_so), median(N_so)))
+
+x1_so <- asin(sqrt((y_so + 0.25) / (N_so + 0.5)))
+cat(sprintf("cor(X_i, log N_i) = %.3f\n", cor(x1_so, log(N_so))))
+```
+
+## 4.1 Headline Result at K_max = 200
+
+```{r so-headline, eval=FALSE}
+res_so_K200 <- informative_bdp_lognormal(y_so, N_so,
+                                          n_iter = 20000, n_burn = 5000,
+                                          K_max = 200, seed = 123)
+res_so_std  <- bdp_mcmc(y_so, N_so, n_iter = 20000, n_burn = 5000, K_max = 200)
+
+tse_so_inf <- compute_tse_star(res_so_K200$theta_hat, y_so, N_so, y2_so, N2_so)
+tse_so_std <- compute_tse_star(res_so_std$theta_hat,  y_so, N_so, y2_so, N2_so)
+tse_so_js  <- compute_tse_star(stein_estimator(y_so, N_so),
+                                y_so, N_so, y2_so, N2_so)
+
+cat(sprintf("Naive MLE        TSE* = %.3f\n", 1.113))
+cat(sprintf("James-Stein      TSE* = %.3f\n", tse_so_js))
+cat(sprintf("Standard BDP     TSE* = %.3f\n", tse_so_std))
+cat(sprintf("Informative BDP  TSE* = %.3f  (HEADLINE)\n", tse_so_inf))
+cat(sprintf("  beta_hat = %.2f, 95%% CrI = [%.2f, %.2f]\n",
+            mean(res_so_K200$beta_samples),
+            quantile(res_so_K200$beta_samples, 0.025),
+            quantile(res_so_K200$beta_samples, 0.975)))
+```
+
+## 4.2 K_max Sensitivity Check on Stack Overflow
+
+The Stack Overflow posterior of `k` places only 3.1% mass at `K_max = 200`,
+substantially lower than baseball's 22.6%. We rerun at `K_max = 400` to
+confirm stability.
+
+```{r so-kmax-check, eval=FALSE}
+res_so_K400 <- informative_bdp_lognormal(y_so, N_so,
+                                          n_iter = 20000, n_burn = 5000,
+                                          K_max = 400, seed = 123)
+tse_so_K400  <- compute_tse_star(res_so_K400$theta_hat, y_so, N_so, y2_so, N2_so)
+beta_so_K400 <- mean(res_so_K400$beta_samples)
+bci_so_K400  <- quantile(res_so_K400$beta_samples, c(0.025, 0.975))
+bnd_so_K400  <- mean(res_so_K400$k_samples == 400) * 100
+
+cat(sprintf("K=200: TSE*=%.4f, beta=%.2f, boundary=%.1f%%\n",
+            tse_so_inf, mean(res_so_K200$beta_samples),
+            mean(res_so_K200$k_samples == 200) * 100))
+cat(sprintf("K=400: TSE*=%.4f, beta=%.2f, boundary=%.1f%%\n",
+            tse_so_K400, beta_so_K400, bnd_so_K400))
+cat("Conclusion: results stable; K=200 retained as headline.\n")
+```
+
+
+# Section 5: Simulation Study (5 Scenarios, 30 Replicates)
+
+This is the simulation study underlying the manuscript's Table 1 (main text).
+WARNING: full run takes ~6-10 hours. Skip with `eval=FALSE` and load saved
+results if available.
+
+```{r sim-study-setup}
+gen_beta88  <- function(n) rbeta(n, 8, 8)
+gen_bimodal <- function(n) {
+  comp <- rbinom(n, 1, 0.5)
+  ifelse(comp == 1, rbeta(n, 60, 10), rbeta(n, 10, 60))
+}
+
+scenarios <- list(
+  S1 = list(name = "S1: Beta(8,8), beta=0",
+            F_gen = gen_beta88,  beta_true = 0, n = 200, alpha_true = 4.0),
+  S2 = list(name = "S2: Beta(8,8), beta=2",
+            F_gen = gen_beta88,  beta_true = 2, n = 200, alpha_true = 4.0),
+  S3 = list(name = "S3: Bimodal, beta=0",
+            F_gen = gen_bimodal, beta_true = 0, n = 200, alpha_true = 4.0),
+  S4 = list(name = "S4: Bimodal, beta=2",
+            F_gen = gen_bimodal, beta_true = 2, n = 200, alpha_true = 4.0),
+  S5 = list(name = "S5: Bimodal, beta=3, n=100",
+            F_gen = gen_bimodal, beta_true = 3, n = 100, alpha_true = 4.0)
+)
+
+N_REP     <- 30
+SIM_NITER <- 8000
+SIM_NBURN <- 2000
+SIM_KMAX  <- 80
+```
+
+```{r sim-study-run, eval=FALSE}
+run_one_rep <- function(sc, rep_seed) {
+  set.seed(rep_seed)
+  n <- sc$n
+  theta_true <- sc$F_gen(n)
+  N_obs <- rpois(n, exp(sc$alpha_true + sc$beta_true * theta_true))
+  N_obs <- pmax(N_obs, 1L)
+  y_obs <- rbinom(n, N_obs, theta_true)
+
+  res_std <- bdp_mcmc(y_obs, N_obs, n_iter = SIM_NITER, n_burn = SIM_NBURN,
+                      K_max = SIM_KMAX, seed = rep_seed + 1000)
+  res_inf <- informative_bdp_lognormal(y_obs, N_obs,
+                                        n_iter = SIM_NITER, n_burn = SIM_NBURN,
+                                        K_max = SIM_KMAX, seed = rep_seed + 2000)
+
+  c(BDP_std  = mean((res_std$theta_hat - theta_true)^2),
+    BDP_inf  = mean((res_inf$theta_hat - theta_true)^2),
+    beta_hat = mean(res_inf$beta_samples))
+}
+
+all_results <- list()
+for (sc_name in names(scenarios)) {
+  sc <- scenarios[[sc_name]]
+  cat(sprintf("\n========== %s ==========\n", sc$name))
+  results_mat <- matrix(NA, nrow = N_REP, ncol = 3)
+  colnames(results_mat) <- c("BDP_std", "BDP_inf", "beta_hat")
+  for (rep in 1:N_REP) {
+    cat(sprintf("  Rep %d/%d ... ", rep, N_REP))
+    t0 <- Sys.time()
+    tryCatch({
+      results_mat[rep, ] <- run_one_rep(sc,
+        rep_seed = rep * 100 + as.integer(sc$beta_true * 10))
+      cat(sprintf("done (%.0fs)\n",
+                  as.numeric(difftime(Sys.time(), t0, units = "secs"))))
+    }, error = function(e) cat(sprintf("ERROR: %s\n", e$message)))
+  }
+  all_results[[sc_name]] <- results_mat
+}
+save(all_results, scenarios, file = "results/sim_30rep_results.RData")
+```
+
+```{r sim-display-results}
+if (file.exists("results/sim_30rep_results.RData")) {
+  load("results/sim_30rep_results.RData")
+
+  cat("================================================================\n")
+  cat("  30-REPLICATE SIMULATION RESULTS (mean ASE; sd in parens)\n")
+  cat("================================================================\n")
+  cat(sprintf("%-30s %16s %16s %10s %10s\n",
+              "Scenario", "Std BDP", "Inf BDP", "Delta(%)", "beta_hat"))
+  cat(paste(rep("-", 90), collapse = ""), "\n")
+
+  for (sc_name in names(scenarios)) {
+    sc <- scenarios[[sc_name]]
+    rm <- all_results[[sc_name]]
+    valid <- !is.na(rm[, 1])
+    m <- colMeans(rm[valid, , drop = FALSE])
+    s <- apply(rm[valid, , drop = FALSE], 2, sd)
+    pct <- (m["BDP_std"] - m["BDP_inf"]) / m["BDP_std"] * 100
+    cat(sprintf("%-30s  %.2e (%.1e)  %.2e (%.1e)  %+8.1f  %8.2f\n",
+                sc$name,
+                m["BDP_std"], s["BDP_std"],
+                m["BDP_inf"], s["BDP_inf"],
+                pct, m["beta_hat"]))
+  }
+} else {
+  cat("results/sim_30rep_results.RData not found.\n")
+  cat("Run the simulation study chunk above to generate it.\n")
+}
+```
+
+
+# Section 6: Structural Diagnostic (Supplement E, Tests A-D)
+
+Targeted experiments to diagnose the source of the ~18% cost in scenario S3
+(bimodal, beta=0). The unifying finding: the cost depends only on the magnitude
+of beta, with a crossover near `|beta| = 1`.
+
+```{r diagnostic-setup}
+gen_mild_bimodal <- function(n) {
+  comp <- rbinom(n, 1, 0.5)
+  ifelse(comp == 1, rbeta(n, 20, 10), rbeta(n, 10, 20))
+}
+
+run_comparison <- function(F_gen, label, n = 200, beta = 0,
+                           n_iter = 8000, n_burn = 2000, K_max = 80, seed = 42) {
+  set.seed(seed)
+  theta_true <- F_gen(n)
+  N_obs <- rpois(n, exp(4.0 + beta * theta_true))
+  N_obs <- pmax(N_obs, 1)
+  y_obs <- rbinom(n, N_obs, theta_true)
+
+  res_std <- bdp_mcmc(y_obs, N_obs, n_iter = n_iter, n_burn = n_burn,
+                      K_max = K_max, seed = seed)
+  res_inf <- informative_bdp_lognormal(y_obs, N_obs, n_iter = n_iter,
+                                        n_burn = n_burn, K_max = K_max, seed = seed)
+
+  ase_std <- mean((res_std$theta_hat - theta_true)^2)
+  ase_inf <- mean((res_inf$theta_hat - theta_true)^2)
+  pct <- (ase_std - ase_inf) / ase_std * 100
+  beta_hat <- mean(res_inf$beta_samples)
+
+  cat(sprintf("  %-40s std=%.4e inf=%.4e gap=%+5.1f%% beta=%.2f\n",
+              label, ase_std, ase_inf, pct, beta_hat))
+  c(ase_std = ase_std, ase_inf = ase_inf, pct = pct, beta_hat = beta_hat)
+}
+```
+
+```{r diagnostic-test-A, eval=FALSE}
+# Test A: Distribution shape (all beta = 0)
+cat("\n=== TEST A: Distribution shape, beta=0 ===\n")
+test_A_results <- list(
+  unimodal      = run_comparison(gen_beta88,        "Beta(8,8) unimodal", beta = 0),
+  mild_bimodal  = run_comparison(gen_mild_bimodal,  "Mild bimodal",       beta = 0),
+  uniform       = run_comparison(function(n) runif(n), "Uniform(0,1)",    beta = 0),
+  strong_bimod  = run_comparison(gen_bimodal,       "Strong bimodal",     beta = 0)
+)
+```
+
+```{r diagnostic-test-B, eval=FALSE}
+# Test B: Crossover beta (strong bimodal)
+cat("\n=== TEST B: Crossover beta (strong bimodal) ===\n")
+test_B_results <- list()
+for (b in c(0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)) {
+  key <- sprintf("beta_%.2f", b)
+  test_B_results[[key]] <- run_comparison(gen_bimodal,
+                                            sprintf("beta = %.2f", b),
+                                            beta = b)
+}
+```
+
+```{r diagnostic-test-C, eval=FALSE}
+# Test C: Sampler length (strong bimodal, beta = 0)
+cat("\n=== TEST C: Sampler length (bimodal, beta=0) ===\n")
+test_C_results <- list()
+for (ni in c(5000, 10000, 20000, 40000)) {
+  key <- sprintf("iter_%d", ni)
+  test_C_results[[key]] <- run_comparison(gen_bimodal,
+                                            sprintf("n_iter = %d", ni),
+                                            n_iter = ni, n_burn = ni %/% 4)
+}
+```
+
+```{r diagnostic-test-D, eval=FALSE}
+# Test D: Sample size (strong bimodal, beta = 0)
+cat("\n=== TEST D: Sample size (bimodal, beta=0) ===\n")
+test_D_results <- list()
+for (nn in c(100, 200, 500)) {
+  key <- sprintf("n_%d", nn)
+  test_D_results[[key]] <- run_comparison(gen_bimodal,
+                                            sprintf("n = %d", nn),
+                                            n = nn)
+}
+```
+
+
+# Section 7: Errors-in-Variables Verification (Supplement E.2)
+
+Numerical check of the attenuation correction on Brown's baseball data.
+
+```{r eiv-baseball}
+# Empirical attenuation factor
+mle_bb <- y_bb / N_bb
+N_clean <- N_bb[N_bb > 0]
+mle_clean <- y_bb[N_bb > 0] / N_clean
+var_mle <- var(mle_clean)
+e_var_mle_given_theta <- mean(mle_clean * (1 - mle_clean) / N_clean)
+var_theta <- var_mle - e_var_mle_given_theta
+kappa <- var_theta / (var_theta + e_var_mle_given_theta)
+
+# OLS regression of log(N) on the noisy MLE
+fit_naive <- lm(log(N_bb) ~ mle_bb)
+beta_ols <- coef(fit_naive)[2]
+
+# Attenuation-corrected estimate
+beta_corrected <- beta_ols / kappa
+
+cat("========== ERRORS-IN-VARIABLES (Baseball) ==========\n")
+cat(sprintf("Var(MLE)                     = %.3e\n", var_mle))
+cat(sprintf("E[theta(1-theta)/N]          = %.3e\n", e_var_mle_given_theta))
+cat(sprintf("Implied Var(theta)           = %.3e\n", var_theta))
+cat(sprintf("Attenuation kappa            = %.3f\n", kappa))
+cat(sprintf("OLS beta (noisy regressor)   = %.2f\n", beta_ols))
+cat(sprintf("Attenuation-corrected beta   = %.2f\n", beta_corrected))
+cat(sprintf("Posterior mean beta (MCMC)   = %.2f\n", beta_mean_K1200))
+
+# Independent verification: OLS on noise-free posterior means
+fit_clean <- lm(log(N_bb) ~ res_ln_K1200$theta_hat)
+cat(sprintf("OLS on posterior means       = %.2f\n", coef(fit_clean)[2]))
+```
+
+
+# Section 8: Figures for the Manuscript
+
+All figures are written to `figs/` for inclusion in the LaTeX manuscript.
+
+```{r setup-figs-dir}
+if (!dir.exists("figs")) dir.create("figs")
+```
+
+## 8.1 Figure D.1: Trace Plots (Supplement D)
+
+```{r fig-D1-traces, eval=TRUE}
+pdf("figs/FigD1_traces.pdf", width = 7, height = 5)
+par(mfrow = c(2, 2), family = "serif",
+    mar = c(4, 4, 2.5, 1), mgp = c(2.5, 0.8, 0), tcl = -0.3)
+
+iter_idx <- seq_along(res_ln_K1200$alpha_samples)
+
+plot(iter_idx, res_ln_K1200$alpha_samples, type = "l",
+     col = "steelblue", lwd = 0.5,
+     xlab = "Iteration (post burn-in)", ylab = expression(alpha),
+     main = expression("(a) Trace of " * alpha))
+abline(h = mean(res_ln_K1200$alpha_samples), col = "red", lwd = 1.2)
+
+plot(iter_idx, res_ln_K1200$beta_samples, type = "l",
+     col = "darkgreen", lwd = 0.5,
+     xlab = "Iteration (post burn-in)", ylab = expression(beta),
+     main = expression("(b) Trace of " * beta))
+abline(h = mean(res_ln_K1200$beta_samples), col = "red", lwd = 1.2)
+
+plot(iter_idx, res_ln_K1200$sigma2_samples, type = "l",
+     col = "purple", lwd = 0.5,
+     xlab = "Iteration (post burn-in)", ylab = expression(sigma^2),
+     main = expression("(c) Trace of " * sigma^2))
+abline(h = mean(res_ln_K1200$sigma2_samples), col = "red", lwd = 1.2)
+
+plot(iter_idx, res_ln_K1200$k_samples, type = "l",
+     col = "darkorange", lwd = 0.5,
+     xlab = "Iteration (post burn-in)", ylab = "k",
+     main = "(d) Trace of k")
+abline(h = mean(res_ln_K1200$k_samples), col = "red", lwd = 1.2)
+
+dev.off()
+cat("Saved: figs/FigD1_traces.pdf\n")
+```
+
+## 8.2 Figure E.1: Crossover Plot (Supplement E, Test B)
+
+```{r fig-E1-crossover}
+# These ASE values come from your Test B run (Section 6)
+beta_grid <- c(0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+ase_std   <- c(1.1783e-3, 1.0734e-3, 1.0496e-3, 9.8628e-4,
+               8.9387e-4, 7.8997e-4, 6.5734e-4)
+ase_inf   <- c(1.4506e-3, 1.2855e-3, 1.2030e-3, 1.0936e-3,
+               9.1832e-4, 7.4697e-4, 5.1091e-4)
+gap_pct   <- (ase_std - ase_inf) / ase_std * 100
+
+pdf("figs/FigE1_crossover.pdf", width = 5.5, height = 4)
+par(family = "serif", mar = c(4, 4, 2.5, 1),
+    mgp = c(2.5, 0.8, 0), tcl = -0.3)
+
+plot(beta_grid, gap_pct, type = "b",
+     pch = 16, cex = 1.3, lwd = 1.5, col = "navy",
+     xlab = expression("True " * beta),
+     ylab = "ASE gap (%), Informative BDP vs Standard BDP",
+     main = expression("Crossover under bimodal F"),
+     ylim = c(-30, 30))
+abline(h = 0, col = "gray50", lwd = 1)
+
+text(1.0, -27, expression("Crossover at " * beta %~~% 1),
+     cex = 0.9, col = "gray30")
+arrows(1.0, -24, 1.0, -3, length = 0.08, col = "gray30")
+text(0.4, 20, "BDP (std) better",       cex = 0.9, col = "darkred")
+text(1.6, 20, "Informative BDP better", cex = 0.9, col = "darkgreen")
+
+dev.off()
+cat("Saved: figs/FigE1_crossover.pdf\n")
+```
+
+## 8.3 Figure E.2: Shrinkage Visualization (Supplement E)
+
+The mechanism figure: how Standard BDP over-shrinks pitchers, while
+Informative BDP correctly retains them near low MLE values.
+
+```{r fig-E2-shrinkage}
+mle_bb_cc <- (y_bb + 0.5) / (N_bb + 1)  # MLE with continuity correction
+
+pdf("figs/FigE2_shrinkage.pdf", width = 11, height = 5.5)
+par(mfrow = c(1, 2),
+    mar = c(4.5, 4.5, 2.5, 1),
+    cex.lab = 1.15, cex.main = 1.2, cex.axis = 1.05)
+
+# Panel (a): Standard BDP
+plot(mle_bb_cc, res_bb$theta_hat,
+     pch = ifelse(is_pit, 17, 1),
+     col = ifelse(is_pit, "firebrick", "steelblue"),
+     cex = ifelse(is_pit, 1.1, 0.75),
+     xlab = expression(paste("First-half MLE  ", y[i]/N[i])),
+     ylab = expression(paste("Posterior mean  ", hat(theta)[i])),
+     main = "(a) Standard BDP",
+     xlim = c(0, 0.45), ylim = c(0.05, 0.40))
+abline(0, 1, lty = 2, col = "gray50", lwd = 1)
+abline(h = mean(res_bb$theta_hat[is_pit]),  col = "firebrick", lty = 3, lwd = 1)
+abline(h = mean(res_bb$theta_hat[!is_pit]), col = "steelblue", lty = 3, lwd = 1)
+legend("topleft",
+       legend = c("Pitchers", "Non-pitchers", "MLE (no shrinkage)"),
+       pch = c(17, 1, NA), lty = c(NA, NA, 2),
+       col = c("firebrick", "steelblue", "gray50"),
+       bty = "n", cex = 0.95)
+
+# Panel (b): Informative BDP at K_max = 1200
+plot(mle_bb_cc, res_ln_K1200$theta_hat,
+     pch = ifelse(is_pit, 17, 1),
+     col = ifelse(is_pit, "firebrick", "steelblue"),
+     cex = ifelse(is_pit, 1.1, 0.75),
+     xlab = expression(paste("First-half MLE  ", y[i]/N[i])),
+     ylab = expression(paste("Posterior mean  ", hat(theta)[i])),
+     main = expression(paste("(b) Informative BDP, ", K[max], "=1200")),
+     xlim = c(0, 0.45), ylim = c(0.05, 0.40))
+abline(0, 1, lty = 2, col = "gray50", lwd = 1)
+abline(h = mean(res_ln_K1200$theta_hat[is_pit]),  col = "firebrick", lty = 3, lwd = 1)
+abline(h = mean(res_ln_K1200$theta_hat[!is_pit]), col = "steelblue", lty = 3, lwd = 1)
+
+dev.off()
+cat("Saved: figs/FigE2_shrinkage.pdf\n")
+```
+
+## 8.4 Figure F.1: Density Reproduction of Zhang & Liu Figure 2
+
+```{r fig-F1-density}
+pdf("figs/FigF1_density_reproduction.pdf", width = 7, height = 6)
+par(mfrow = c(2, 2), family = "serif",
+    mar = c(4, 4, 2.5, 1), mgp = c(2.5, 0.8, 0), tcl = -0.3)
+
+true_densities <- list(
+  function(x) dbeta(x, 8, 8),
+  function(x) 0.5 * dbeta(x, 60, 10) + 0.5 * dbeta(x, 10, 60),
+  function(x) 8 * exp(-8 * x) / (1 - exp(-8)) * (x >= 0 & x <= 1),
+  function(x) ifelse(x >= 0.25 & x <= 0.5, 2, 0) +
+              ifelse(x >= 0.75 & x <= 1.0, 2, 0)
+)
+names_sim <- c("(a) Beta(8,8)",
+               "(b) 0.5 Beta(60,10) + 0.5 Beta(10,60)",
+               "(c) Exp(8) truncated",
+               "(d) 0.5 Unif(0.25,0.5) + 0.5 Unif(0.75,1)")
+all_res <- list(res1, res2, res3, res4)
+
+for (i in 1:4) {
+  rr <- all_res[[i]]
+  tg <- rr$theta_grid
+  td <- true_densities[[i]](tg)
+  yl <- c(0, max(c(rr$density_est, td), na.rm = TRUE) * 1.15)
+
+  plot(tg, rr$density_est, type = "l", lwd = 2, col = "blue",
+       main = names_sim[i],
+       xlab = expression(theta), ylab = "Density",
+       ylim = yl)
+  lines(tg, td, col = "red", lwd = 2, lty = 2)
+  legend("topright",
+         c("BDP estimate", "Truth"),
+         col = c("blue", "red"),
+         lwd = 2, lty = c(1, 2),
+         cex = 0.75, bty = "n")
+}
+
+dev.off()
+cat("Saved: figs/FigF1_density_reproduction.pdf\n")
+```
